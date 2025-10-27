@@ -1,0 +1,343 @@
+---
+title: "Aqueous"
+author: "Sriya Rajyam"
+date: "2025-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required packages
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(ggplot2)
+#install.packages("clustree")
+library(clustree) 
+library(patchwork)
+#install.packages("harmony")
+library(harmony)
+```
+
+```{r}
+packageVersion("SeuratObject")
+```
+
+
+
+```{r}
+# Define path
+data_dir <- "/Users/sriyarajyam/Documents/data"
+
+# List subdirectories
+sample_folders <- list.dirs(data_dir, full.names = TRUE, recursive = FALSE)
+
+# Sample names
+sample_names <- basename(sample_folders)
+
+# Load function (as you had it)
+load_sample <- function(sample_path) {
+  sample_name <- basename(sample_path)
+  matrix_path <- file.path(sample_path, "matrix.mtx.gz")
+  features_path <- file.path(sample_path, "features.tsv.gz")
+  barcodes_path <- file.path(sample_path, "barcodes.tsv.gz")
+  
+  expression_matrix <- ReadMtx(mtx = matrix_path, features = features_path, cells = barcodes_path)
+  seurat_obj <- CreateSeuratObject(counts = expression_matrix, project = sample_name)
+  seurat_obj$sample <- sample_name
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  return(seurat_obj)
+}
+
+# Load and name
+seurat_list <- setNames(lapply(sample_folders, load_sample), sample_names)
+
+```
+
+```{r}
+seurat_list
+```
+
+
+```{r}
+# Find the intersection of features across all samples
+common_features <- Reduce(intersect, lapply(seurat_list, rownames))
+
+# Subset each Seurat object to retain only common features
+seurat_list <- lapply(seurat_list, function(obj) {
+  obj <- subset(obj, features = common_features)
+  return(obj)
+})
+
+# Merge all Seurat objects
+integrated_seurat <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = basename(sample_folders))
+
+```
+
+```{r}
+seurat_list
+```
+
+```{r}
+# Apply QC filtering
+integrated_seurat <- subset(integrated_seurat, 
+                            subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & 
+                                     nCount_RNA > 1000 & nCount_RNA < 40000 & 
+                                     percent.mt < 5)
+integrated_seurat
+```
+
+
+```{r}
+# Normalize Data
+integrated_seurat <- NormalizeData(integrated_seurat, name="RNA")
+
+# Identify Variable Features
+integrated_seurat <- FindVariableFeatures(integrated_seurat, selection.method = "vst", nfeatures = 1500)
+
+top10 <- head(VariableFeatures(integrated_seurat), 10)
+plot1 <- VariableFeaturePlot(integrated_seurat)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+# cale Data & Run PCA
+integrated_seurat <- ScaleData(integrated_seurat)
+integrated_seurat <- RunPCA(integrated_seurat)
+integrated_seurat <- RunHarmony(integrated_seurat, "sample")
+
+# Find Neighbors
+integrated_seurat <- FindNeighbors(integrated_seurat, reduction = "harmony", dims = 1:10)
+```
+```{r}
+# Your specific genes
+my_genes <- c("POU6F2",
+"MXRA5",
+"FGFR2",
+"ADAMTS9-AS2",
+"FIBIN",
+"MEG3",
+"PITX2")
+
+# Plot the variable features
+plot1 <- VariableFeaturePlot(integrated_seurat)
+
+# Add your custom labels
+plot2 <- LabelPoints(plot = plot1, points = my_genes, repel = TRUE)
+
+# Combine
+plot1 + plot2
+
+```
+
+
+```{r}
+# Run clustering at multiple resolutions for optimization
+resolutions <- seq(1.0, 1.6, by = 0.1)
+for (res in resolutions) {
+  integrated_seurat <- FindClusters(integrated_seurat, resolution = res)
+}
+
+# Visualize clustering results at different resolutions
+clustree(integrated_seurat, prefix = "RNA_snn_res.")
+```
+
+
+```{r}
+# Choose best resolution (0.6 based on Clustree)
+optimal_res <- 1.4
+integrated_seurat <- FindClusters(integrated_seurat, resolution = optimal_res)
+
+# Run UMAP for Visualization
+integrated_seurat <- RunUMAP(integrated_seurat, reduction = "harmony", dims = 1:10)
+
+# Plot UMAP with Sample Labels & Clusters
+p1 <- DimPlot(integrated_seurat, reduction = "umap", group.by = "sample") + ggtitle("UMAP by Sample")
+p2 <- DimPlot(integrated_seurat, reduction = "umap", group.by = "seurat_clusters") + ggtitle("UMAP by Clusters")
+p1 + p2
+```
+```{r}
+# Choose best resolution (0.6 based on Clustree)
+
+# Plot UMAP with Sample Labels & Clusters
+# Step 1: Add log-transformed counts to metadata
+integrated_seurat$log_nCount_RNA <- log1p(integrated_seurat$nCount_RNA)
+
+p3 <- FeaturePlot(integrated_seurat, features = "log_nCount_RNA")
+#p4 <- FeaturePlot(integrated_seurat, features = "nFeature_RNA")
+p3
+```
+
+```{r}
+VlnPlot(integrated_seurat, features = "log_nCount_RNA", group.by = "seurat_clusters")
+```
+
+
+```{r}
+getwd()
+```
+
+
+```{r}
+# Save unlabeled Seurat object
+saveRDS(integrated_seurat, file = "aqueous07_28.rds")
+```
+
+
+```{r}
+# Identify cluster markers using FindAllMarkers
+cluster_markers <- FindAllMarkers(integrated_seurat, 
+                                  only.pos = TRUE,  
+                                  min.pct = 0.25,
+                                  logfc.threshold = 0.25)
+
+
+# Save FindMarkers results
+write.csv(cluster_markers, "cluster_markers07_17_1.4_1500.csv", row.names = FALSE)
+```
+```{r}
+between_markers <- FindMarkers(integrated_seurat, ident.1 = 7, ident.2 = 9)
+head(between_markers)
+write.csv(between_markers, "comparison_markers07_17_1.4_1500.csv", row.names = TRUE)
+```
+
+
+```{r}
+DimPlot(integrated_seurat, label = T)
+```
+
+
+```{r}
+seurat.new <- RenameIdents(integrated_seurat,
+                                `0` = "T-Cells",
+                                `1` = "NK Cells",
+                                `2` = "T-Cells",
+                                `3` = "Macrophages",
+                                `4` = "Monocytes",
+                                `5` = "Macrophages",
+                                `6` = "Fibroblasts",
+                                `7` = "Fibroblasts",
+                                `8` = "Monocytes",
+                                `9` = "Melanocytes",
+                                `10` = "B-Cells") 
+
+seurat.new$CellType <- Idents(seurat.new)
+
+seurat.new.plot <- seurat.new
+
+DefaultAssay(seurat.new.plot) <- "RNA"
+
+ #Reorder cell types by similarity
+ Idents(seurat.new.plot) <- factor(
+   Idents(seurat.new.plot), 
+   levels = c('T-Cells',  
+              'NK Cells',
+              'B-Cells',
+              'Macrophages',  
+              'Monocytes',  
+              'Fibroblasts',  
+              'Melanocytes'  
+              )
+ )
+markers.to.plot <- c(
+  'CD3D', 'CD3E', 'IL32', # T cells
+  'NKG7', 'GNLY', 'GZMA', 'PRF1',  # Natural killer cells
+  'MS4A1', 'CD79A', 'CD74',  # B cells
+  'F13A1', 'CD163', 'AIF1',  # macrophages
+  'LYN', 'VCAN', 'LYZ', 'FCGR3A', 'FCN1',  # Monocytes
+  #'CD163', 'CSF1R',  # Monocyte-derived macrophages
+  'FBLN1', 'RARRES1', 'IGF2',  # Fibroblasts
+  #'ACTA2', 'TPM2', 'TAGLN', 'MYL9',  # Smooth muscle cells
+  'TRPM1', 'MLANA', 'PMEL' #cluster 9
+)
+
+seurat.new.plot@active.ident <- factor(seurat.new.plot@active.ident, 
+                            levels=rev(c('T-Cells',  
+              'NK Cells',
+              'B-Cells',
+              'Macrophages',  
+              'Monocytes',  
+              'Fibroblasts',  
+              'Melanocytes' )))
+
+# Generate DotPlot with new ordering
+DotPlot(seurat.new.plot, 
+        features = markers.to.plot, 
+        cols = c("blue", "red"), 
+        scale = FALSE) +  
+        xlab("") + 
+        ylab("") +
+        scale_size_area(limits = c(0, 100), max_size = 4) +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size=10), 
+              axis.text.y = element_text(size = 10),
+              legend.key.size = unit(0.5, 'cm'),  
+              legend.title = element_text(size=10),
+              legend.text = element_text(size=10) )
+
+```
+
+
+
+```{r}
+DimPlot(seurat.new.plot)
+```
+
+
+```{r}
+# Subset clusters 3 and 5 (change as needed)
+TCell_obj <- subset(integrated_seurat, idents = c("0","2"))
+
+# Plot UMAP of just these two clusters
+DimPlot(TCell_obj, reduction = "umap") + ggtitle("T-Cells")
+
+```
+
+
+```{r}
+saveRDS(TCell_obj, file = "TCell_obj.rds")
+```
+
+```{r}
+# Make sure you're working with the full RNA assay
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Check that the counts slot exists
+slotNames(seurat_obj[["RNA"]])
+# Should show: "counts" "data" "scale.data"
+
+# -------------------------------
+# 3. Convert Seurat → AnnData
+# -------------------------------
+# This step exports your full counts matrix, metadata, and reductions
+adata <- as_AnnData(
+  seurat_obj,
+  assay = "RNA",      # which Seurat assay to use
+  layer = "counts"    # ensures all genes (raw counts) are exported
+)
+
+# -------------------------------
+# 4. (Optional) Add normalized & scaled matrices as layers
+# -------------------------------
+# These will appear as adata.layers['normalized'] and ['scaled'] in Scanpy
+adata$layers[["normalized"]] <- t(GetAssayData(woopity_obj, slot = "data"))
+#adata$layers[["scaled"]] <- t(GetAssayData(woopity_obj, slot = "scale.data"))
+
+# -------------------------------
+# 5. Write to h5ad file
+# -------------------------------
+write_h5ad(adata, path = "aqueous.h5ad")
+
+# -------------------------------
+# 6. Verify inside R (optional)
+# -------------------------------
+adata
+# Expected output:
+# AnnData object with n_obs × n_vars = [cells × genes]
+#     layers: 'counts', 'normalized', 'scaled'
+#     obsm: 'X_pca', 'X_umap' (if present)
+#     obs: your Seurat meta.data columns
+```
+
+
